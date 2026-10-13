@@ -245,12 +245,37 @@ _TOOL_HANDLERS = {
 }
 
 
+# AgentCore Gateway passes Lambda targets the tool name as "<target>___<tool>".
+_GATEWAY_TOOL_DELIMITER = "___"
+
+
+def _gateway_tool_name(context) -> str | None:
+    """Return the tool name when invoked by an AgentCore Gateway Lambda target.
+
+    The gateway passes the tool arguments as the event and the tool name in
+    context.client_context.custom["bedrockAgentCoreToolName"]. Returns None for
+    direct invocations, which carry no gateway metadata.
+
+    NOTE: identical copy in each backend/mcp_servers/*/handler.py. Each Lambda is
+    packaged from its own directory, so the helper cannot be shared.
+    """
+    custom = getattr(getattr(context, "client_context", None), "custom", None)
+    if not isinstance(custom, dict):
+        return None
+    name = custom.get("bedrockAgentCoreToolName")
+    if not isinstance(name, str) or not name:
+        return None
+    return name.split(_GATEWAY_TOOL_DELIMITER, 1)[-1]
+
+
 def handler(event, context):
     """Lambda handler for Market Signals MCP Server.
 
     Dispatches to the appropriate tool handler based on the 'tool' field
     in the event body. Each tool returns randomized data that varies
-    between invocations to simulate real-world market volatility.
+    between invocations to simulate real-world market volatility. Also accepts
+    the AgentCore Gateway invocation shape: the event is the tool arguments and
+    the tool name is in the Lambda context (see _gateway_tool_name).
 
     Args:
         event: Lambda event payload containing MCP tool invocation details.
@@ -272,6 +297,12 @@ def handler(event, context):
 
         tool_name = body.get("tool")
         params = body.get("params", {})
+
+        if not tool_name:
+            # AgentCore Gateway invocation: the event is the tool arguments.
+            tool_name = _gateway_tool_name(context)
+            if tool_name:
+                params = body
 
         # Validate tool name
         if not tool_name:

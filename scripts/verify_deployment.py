@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 def check_mark(passed: bool) -> str:
@@ -147,6 +147,152 @@ def verify_agent_arns() -> tuple[bool, int]:
     return len(arns) >= 6, len(arns)
 
 
+# The six AgentCore runtimes deployed by scripts/deploy_agentcore.py
+# (agent short name -> runtime name). Keep in sync with AGENTS there.
+AGENT_RUNTIME_NAMES = {
+    "competitive-intelligence": "retailPricing_competitiveIntelligence",
+    "demand-forecasting": "retailPricing_demandForecasting",
+    "market-intelligence": "retailPricing_marketIntelligence",
+    "strategy-synthesis": "retailPricing_strategySynthesis",
+    "implementation-monitoring": "retailPricing_implementationMonitoring",
+    "orchestrator": "retailPricing_orchestrator",
+}
+
+# Names used by scripts/setup_gateway.py and scripts/setup_memory.py.
+GATEWAY_NAME = "retail-pricing-gateway"
+MEMORY_NAME = "RetailDynamicPricingMemory"
+
+# Env vars deploy_agentcore.py must set on EVERY runtime. Without them the agents
+# silently run with no gateway tools and no memory.
+GATEWAY_ENV_VAR = "AGENTCORE_GATEWAY_ENDPOINT"
+MEMORY_ENV_VAR = "AGENTCORE_MEMORY_ID"
+
+
+def _list_all(call, keys: tuple[str, ...]) -> list[dict]:
+    """Collect every item of a paginated bedrock-agentcore-control list_* call."""
+    items: list[dict] = []
+    token = None
+    while True:
+        response = call(nextToken=token) if token else call()
+        for key in keys:
+            items.extend(response.get(key, []))
+        token = response.get("nextToken")
+        if not token:
+            return items
+
+
+def _live_gateway_endpoint(client) -> str:
+    """MCP endpoint (<gatewayUrl>/mcp) of the deployed gateway, or '' if not found."""
+    for gateway in _list_all(client.list_gateways, ("items",)):
+        if gateway.get("name") == GATEWAY_NAME:
+            url = client.get_gateway(gatewayIdentifier=gateway["gatewayId"]).get("gatewayUrl", "")
+            return f"{url.rstrip('/')}/mcp" if url else ""
+    return ""
+
+
+def _live_memory_id(client) -> str:
+    """ID of the deployed AgentCore Memory, or '' if not found."""
+    for memory in _list_all(client.list_memories, ("memories",)):
+        memory_id = memory.get("id") or memory.get("memoryId") or ""
+        if memory_id.startswith(f"{MEMORY_NAME}-"):
+            return memory_id
+    return ""
+
+
+def verify_agent_wiring(region: str) -> tuple[bool, list[tuple[str, bool, str]], list[str]]:
+    """Verify every AgentCore runtime is wired to the gateway and memory.
+
+    For each of the six runtimes, reads the environment variables of the runtime
+    version its DEFAULT endpoint actually serves (an update creates a new version
+    while the endpoint may still point at the old one) and requires non-empty
+    AGENTCORE_GATEWAY_ENDPOINT and AGENTCORE_MEMORY_ID. Also requires all six to
+    agree with each other and with the live gateway and memory, so the gate fails
+    if wiring regresses (unwired, stale or mismatched agents).
+
+    Returns (passed, per-agent rows of (name, ok, detail), shared problems).
+    """
+    client = boto3.client("bedrock-agentcore-control", region_name=region)
+    rows: list[tuple[str, bool, str]] = []
+    shared_problems: list[str] = []
+    gateway_values: set[str] = set()
+    memory_values: set[str] = set()
+
+    try:
+        runtime_ids = {
+            r.get("agentRuntimeName"): r.get("agentRuntimeId")
+            for r in _list_all(client.list_agent_runtimes, ("agentRuntimes",))
+        }
+    except (ClientError, BotoCoreError) as e:
+        return False, [], [f"could not list AgentCore runtimes: {e}"]
+
+    for agent, runtime_name in AGENT_RUNTIME_NAMES.items():
+        runtime_id = runtime_ids.get(runtime_name)
+        if not runtime_id:
+            rows.append((agent, False, f"runtime {runtime_name} not found"))
+            continue
+        try:
+            endpoint = client.get_agent_runtime_endpoint(
+                agentRuntimeId=runtime_id, endpointName="DEFAULT"
+            )
+            live_version = str(endpoint.get("liveVersion") or "")
+            target_version = str(endpoint.get("targetVersion") or live_version)
+            if not live_version:
+                rows.append((agent, False, f"DEFAULT endpoint serves no version yet (status {endpoint.get('status')})"))
+                continue
+            env = client.get_agent_runtime(
+                agentRuntimeId=runtime_id, agentRuntimeVersion=live_version
+            ).get("environmentVariables") or {}
+        except (ClientError, BotoCoreError) as e:
+            rows.append((agent, False, f"could not read runtime {runtime_id}: {e}"))
+            continue
+
+        problems = []
+        gateway = (env.get(GATEWAY_ENV_VAR) or "").strip()
+        memory = (env.get(MEMORY_ENV_VAR) or "").strip()
+        if not gateway:
+            problems.append(f"{GATEWAY_ENV_VAR} missing or empty")
+        elif not (gateway.startswith("https://") and gateway.endswith("/mcp")):
+            problems.append(f"{GATEWAY_ENV_VAR} is not a gateway MCP URL (must end with /mcp): {gateway}")
+        else:
+            gateway_values.add(gateway)
+        if not memory:
+            problems.append(f"{MEMORY_ENV_VAR} missing or empty")
+        else:
+            memory_values.add(memory)
+        if target_version != live_version:
+            problems.append(f"DEFAULT endpoint still moving from v{live_version} to v{target_version}")
+
+        detail = f"v{live_version}: " + (
+            "; ".join(problems) if problems else f"{GATEWAY_ENV_VAR} and {MEMORY_ENV_VAR} set"
+        )
+        rows.append((agent, not problems, detail))
+
+    # All agents must be wired to the same gateway / memory ...
+    if len(gateway_values) > 1:
+        shared_problems.append(f"agents disagree on {GATEWAY_ENV_VAR}: {sorted(gateway_values)}")
+    if len(memory_values) > 1:
+        shared_problems.append(f"agents disagree on {MEMORY_ENV_VAR}: {sorted(memory_values)}")
+
+    # ... and to the resources that actually exist.
+    try:
+        live_gateway = _live_gateway_endpoint(client)
+        live_memory = _live_memory_id(client)
+    except (ClientError, BotoCoreError) as e:
+        shared_problems.append(f"could not look up the live gateway/memory: {e}")
+    else:
+        if not live_gateway:
+            shared_problems.append(f"gateway '{GATEWAY_NAME}' not found")
+        elif gateway_values and gateway_values != {live_gateway}:
+            shared_problems.append(f"{GATEWAY_ENV_VAR} {sorted(gateway_values)} != live gateway {live_gateway}")
+        if not live_memory:
+            shared_problems.append(f"memory '{MEMORY_NAME}' not found")
+        elif memory_values and memory_values != {live_memory}:
+            shared_problems.append(f"{MEMORY_ENV_VAR} {sorted(memory_values)} != live memory {live_memory}")
+
+    passed = all(ok for _, ok, _ in rows) and len(rows) == len(AGENT_RUNTIME_NAMES) and not shared_problems
+    return passed, rows, shared_problems
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify deployment health")
     parser.add_argument("--region", default="us-east-1", help="AWS region")
@@ -216,6 +362,17 @@ def main():
     agents_passed, agent_count = verify_agent_arns()
     print(f"    {check_mark(agents_passed)} Agent ARNs: {agent_count}/6 configured")
     all_passed = all_passed and agents_passed
+
+    # 8. Agent wiring: every runtime must have the gateway + memory env vars
+    print("\n  AgentCore Wiring (gateway + memory env vars on the served runtime version):")
+    wiring_passed, wiring_rows, wiring_problems = verify_agent_wiring(args.region)
+    for agent, ok, detail in wiring_rows:
+        print(f"    {check_mark(ok)} {agent}: {detail}")
+    for problem in wiring_problems:
+        print(f"    {check_mark(False)} {problem}")
+    if wiring_passed:
+        print(f"    {check_mark(True)} All {len(wiring_rows)} runtimes wired to the live gateway and memory")
+    all_passed = all_passed and wiring_passed
 
     # Summary
     print("")

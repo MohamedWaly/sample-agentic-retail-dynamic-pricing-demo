@@ -167,6 +167,7 @@ An agentic AI system that transforms retail pricing from a manual 6-10 week proc
 ### Agent Deployment
 - Docker containers built locally, pushed to ECR
 - `deploy_agentcore.py` script creates/updates AgentCore Runtimes
+- The AgentCore Gateway and Memory are created first; `deploy_agentcore.py` wires every runtime to them with the `AGENTCORE_GATEWAY_ENDPOINT` (gateway MCP URL) and `AGENTCORE_MEMORY_ID` environment variables, and `verify_deployment.py` fails if a runtime is missing either
 - Each agent is independently deployable and scalable
 
 ### CI/CD Ready

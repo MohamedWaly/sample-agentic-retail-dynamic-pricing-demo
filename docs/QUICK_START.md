@@ -44,29 +44,14 @@ This creates:
 
 Note the CDK outputs — you'll need: API Gateway URL, User Pool ID, Client ID, Cognito Domain, CloudFront URLs, S3 bucket names.
 
-### 3. Deploy AgentCore Agents
+### 3. Create the IAM Role, AgentCore Gateway & Memory
+
+These must exist **before** the agents are deployed (step 4): the agents are wired to the gateway and memory at deploy time.
 
 ```bash
-# Create the IAM role for AgentCore
+# Create (or update in place) the IAM role for AgentCore
 python3 scripts/create_agentcore_role.py --region us-east-1
 
-# Deploy all 6 agents to AgentCore Runtime (requires Docker running)
-python3 scripts/deploy_agentcore.py \
-  --region us-east-1 \
-  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/RetailPricingAgentCoreRole
-```
-
-### 4. Re-deploy CDK (links agents to Lambda)
-
-The agent deploy script saves ARNs to `scripts/agent_arns.env`. Re-deploy so the Lambda picks up the orchestrator ARN:
-
-```bash
-npx cdk deploy --all --require-approval never
-```
-
-### 5. Setup AgentCore Gateway & Memory
-
-```bash
 # Get MCP Server Lambda ARNs
 aws lambda list-functions \
   --query "Functions[?starts_with(FunctionName,'rdp-mcp-')].[FunctionName,FunctionArn]" \
@@ -81,6 +66,25 @@ export COST_FINANCE_LAMBDA_ARN=<ARN for rdp-mcp-cost-finance>
 # Setup gateway and memory
 python3 scripts/setup_gateway.py --region us-east-1
 python3 scripts/setup_memory.py --region us-east-1
+```
+
+### 4. Deploy AgentCore Agents
+
+```bash
+# Deploy all 6 agents to AgentCore Runtime (requires Docker running)
+python3 scripts/deploy_agentcore.py \
+  --region us-east-1 \
+  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/RetailPricingAgentCoreRole
+```
+
+The script discovers the gateway and memory from step 3 and sets `AGENTCORE_GATEWAY_ENDPOINT` (the gateway's `/mcp` URL), `AGENTCORE_MEMORY_ID`, the model IDs and (orchestrator only) the specialist ARNs as environment variables on every runtime, on create and update. No manual `export` is needed. It exits non-zero before building anything if the gateway or memory is missing.
+
+### 5. Re-deploy CDK (links agents to Lambda)
+
+The agent deploy script saves ARNs to `scripts/agent_arns.env`. Re-deploy so the Lambda picks up the orchestrator ARN:
+
+```bash
+npx cdk deploy --all --require-approval never
 ```
 
 ### 6. Seed Product Data
@@ -214,6 +218,7 @@ See [docs/KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed deployment issues and r
 | CDK can't find aws_cdk module | Ensure venv is active; use `--app ".venv/bin/python3 cdk/app.py"` if path has spaces |
 | ECR permission error on agent deploy | Fixed in `create_agentcore_role.py` — uses `retail-pricing/*` resource path |
 | Gateway target registration fails ("gateway is in CREATING status") | `setup_gateway.py` now waits for the gateway to reach READY before registering targets — just re-run it. "Target type LAMBDA is not supported for synchronization" is expected and non-fatal (Lambda targets get their tools from the inline toolSchema at registration). |
+| `deploy_agentcore.py` exits with "gateway ... not found" / "memory ... not found" | Run step 3 first (`setup_gateway.py`, `setup_memory.py`). The agent deploy refuses to create agents that are not wired to them. |
 | CORS error on /billing or /reset | Route must exist in API Gateway CDK — verify with `npx cdk deploy` |
 | Login redirect_mismatch | Update callback URLs (Step 9) with actual CloudFront domain |
 | Pricing cycle AccessDenied | Lambda needs DynamoDB Scan/BatchWriteItem + AgentCore InvokeAgentRuntime |

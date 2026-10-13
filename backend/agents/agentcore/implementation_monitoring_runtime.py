@@ -111,11 +111,13 @@ def invoke(payload: dict) -> dict:
             generate_adjustment,
         )
         from strands import Agent
-        from backend.agents.agentcore.guardrail_config import get_guardrail_config
+        from strands.models import BedrockModel
+        from backend.agents.agentcore.guardrail_config import get_guardrail_model_kwargs
 
-        guardrail_kwargs = get_guardrail_config()
+        # The Bedrock guardrail (if configured) is attached to the model, not to the Agent.
+        model = BedrockModel(model_id=SPECIALIST_MODEL, **get_guardrail_model_kwargs())
         agent = Agent(
-            model=SPECIALIST_MODEL,
+            model=model,
             system_prompt=IMPLEMENTATION_MONITORING_SYSTEM_PROMPT,
             tools=[
                 execute_price_update,
@@ -124,7 +126,6 @@ def invoke(payload: dict) -> dict:
                 generate_adjustment,
             ],
             session_manager=session_manager,
-            **guardrail_kwargs,
         )
 
         result = agent(full_prompt)

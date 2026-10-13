@@ -7,6 +7,10 @@ endpoint rather than connecting to individual MCP servers directly.
 Usage:
     python scripts/setup_gateway.py [--region us-east-1]
 
+Run this (and scripts/setup_memory.py) BEFORE scripts/deploy_agentcore.py: the
+agent deploy discovers the gateway by name and wires its MCP endpoint into every
+agent runtime. Requires the IAM role from scripts/create_agentcore_role.py.
+
 Required environment variables:
     COMPETITOR_API_LAMBDA_ARN: ARN of the Competitor API MCP Server Lambda
     ERP_POS_LAMBDA_ARN: ARN of the ERP/POS MCP Server Lambda
@@ -242,11 +246,21 @@ def setup_gateway(region: str = "us-east-1") -> str:
     if synced:
         print(f"  Synchronized {synced}/{len(target_ids)} targets")
 
+    gateway_url = client.get_gateway(gatewayIdentifier=gateway_id).get("gatewayUrl", "")
+    if not gateway_url:
+        raise RuntimeError(f"Gateway {gateway_id} has no gatewayUrl; cannot derive its MCP endpoint.")
+    mcp_endpoint = f"{gateway_url.rstrip('/')}/mcp"
+
     print(f"\nGateway setup complete!")
     print(f"  Gateway ID: {gateway_id}")
     print(f"  Targets registered: {len(mcp_targets)}")
-    print(f"\nExport the gateway endpoint for your agent containers:")
-    print(f"  export AGENTCORE_GATEWAY_ENDPOINT=<gateway-endpoint-url>")
+    print(f"  MCP endpoint: {mcp_endpoint}")
+    print(
+        "\nscripts/deploy_agentcore.py discovers this gateway by name and sets "
+        "AGENTCORE_GATEWAY_ENDPOINT on every agent runtime automatically."
+    )
+    print(f"To run an agent container by hand, export the MCP endpoint (note the /mcp suffix):")
+    print(f"  export AGENTCORE_GATEWAY_ENDPOINT={mcp_endpoint}")
 
     return gateway_id
 
