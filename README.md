@@ -143,7 +143,7 @@ The AI models used by the pricing agents are configurable. The system scans your
 
 ### During Initial Deployment
 
-Model selection runs automatically as Step 1.7 in `deploy.sh`. You'll see a table of available models with status indicators and choose one interactively. The selected model ID is written to `model-config.json` (as both `modelId` and `specialistModelId`) and is used by all agents — the AgentCore runtime containers read the shared model configuration (`ORCHESTRATOR_MODEL` / `SPECIALIST_MODEL`) at startup rather than hardcoding model IDs. Both tiers default to the selected model unless the `SPECIALIST_MODEL_ID` environment variable overrides the specialist tier.
+Model selection runs automatically as Step 1.7 in `deploy.sh`. You'll see a table of available models with status indicators and choose one interactively. The selected model ID is written to `model-config.json` (as both `modelId` and `specialistModelId`) and is used by all agents — the AgentCore runtime containers read the shared model configuration (`ORCHESTRATOR_MODEL` / `SPECIALIST_MODEL`) at startup rather than hardcoding model IDs. `model-config.json` is not part of the container image, so `deploy_agentcore.py` passes the selected IDs to every runtime as the `ORCHESTRATOR_MODEL_ID` / `SPECIALIST_MODEL_ID` environment variables (re-run it to apply a model change). Both tiers default to the selected model unless the `SPECIALIST_MODEL_ID` environment variable overrides the specialist tier.
 
 ### Switching Models After Deployment
 
@@ -204,7 +204,7 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-The script automates all steps below, including prerequisites check, CDK deployment, agent deployment, data seeding, user creation, and frontend build. Supports `--skip-agents` and `--skip-frontend` flags for partial redeployments.
+The script automates all steps below, including prerequisites check, CDK deployment, AgentCore role/gateway/memory setup, agent deployment, data seeding, user creation, and frontend build. Supports `--skip-agents` and `--skip-frontend` flags for partial redeployments (`--skip-agents` skips only the agent deploy in Step 4; the role, gateway and memory are still created).
 
 After deployment completes, run the validation script:
 
@@ -243,30 +243,14 @@ npx cdk deploy --all --require-approval never
 
 Note the outputs: API Gateway URL, Cognito User Pool ID, Client ID, CloudFront domains, S3 bucket names.
 
-### 3. Deploy AgentCore Agents
+### 3. Create the IAM Role, AgentCore Gateway & Memory
+
+The gateway and memory must exist **before** the agents are deployed (step 4), because the agents are wired to them at deploy time.
 
 ```bash
-# Create IAM role for AgentCore
+# IAM role for AgentCore (re-run any time to update its permissions in place)
 python scripts/create_agentcore_role.py --region us-east-1
 
-# Deploy all 6 agents to AgentCore Runtime
-python scripts/deploy_agentcore.py \
-  --region us-east-1 \
-  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/RetailPricingAgentCoreRole
-```
-
-### 4. Re-deploy CDK (links agents to Lambda)
-
-The agent deploy script saves agent ARNs to `scripts/agent_arns.env`. Re-deploy CDK
-so the pricing cycles Lambda picks up the orchestrator ARN:
-
-```bash
-npx cdk deploy --all --require-approval never
-```
-
-### 5. Setup AgentCore Gateway & Memory
-
-```bash
 # Export MCP Server Lambda ARNs (get from: aws lambda list-functions --query "Functions[?starts_with(FunctionName,'rdp-mcp-')].[FunctionName,FunctionArn]" --output table)
 export COMPETITOR_API_LAMBDA_ARN=<ARN for rdp-mcp-competitor-api>
 export ERP_POS_LAMBDA_ARN=<ARN for rdp-mcp-erp-pos>
@@ -275,6 +259,26 @@ export COST_FINANCE_LAMBDA_ARN=<ARN for rdp-mcp-cost-finance>
 
 python scripts/setup_gateway.py --region us-east-1
 python scripts/setup_memory.py --region us-east-1
+```
+
+### 4. Deploy AgentCore Agents
+
+```bash
+# Deploy all 6 agents to AgentCore Runtime
+python scripts/deploy_agentcore.py \
+  --region us-east-1 \
+  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/RetailPricingAgentCoreRole
+```
+
+`deploy_agentcore.py` discovers the gateway and memory from step 3 and sets these environment variables on every runtime (on create and on update), so no manual `export` is needed: `AGENTCORE_GATEWAY_ENDPOINT` (the gateway's MCP URL, `<gatewayUrl>/mcp`), `AGENTCORE_MEMORY_ID`, the model IDs (`ORCHESTRATOR_MODEL_ID` / `SPECIALIST_MODEL_ID`), and, for the orchestrator, the five specialist runtime ARNs. It exits non-zero without building anything if the gateway or memory cannot be found.
+
+### 5. Re-deploy CDK (links agents to Lambda)
+
+The agent deploy script saves agent ARNs to `scripts/agent_arns.env`. Re-deploy CDK
+so the pricing cycles Lambda picks up the orchestrator ARN:
+
+```bash
+npx cdk deploy --all --require-approval never
 ```
 
 ### 6. Seed Data
@@ -498,6 +502,8 @@ A comprehensive STRIDE threat model has been completed for this solution. See [`
 - Optional KMS CMK encryption for sensitive tables
 - Memory integrity hashing (SHA-256) for AgentCore Memory with fail-closed verification
 
+**Intentionally unauthenticated:** `GET /products` and `GET /products/{id}` are public (the Storefront calls them without a token); all other API routes require Cognito. The AgentCore Gateway's inbound authorizer is `NONE` in this sample. See [Demo Limitations](#demo-limitations--production-considerations).
+
 ---
 
 ## Demo Limitations & Production Considerations
@@ -509,9 +515,10 @@ This solution is a functional demonstration. Several features illustrate product
 | **Scheduling Tab** | Displays configuration UI for autonomous pricing schedules (frequency, triggers, approval windows). Settings are persisted locally in the browser but do not trigger actual scheduled executions. | Integrate with Amazon EventBridge Scheduler to create cron/rate rules that invoke `POST /pricing-cycles`. Add a DynamoDB `Schedules` table to persist configuration server-side, with Lambda-backed CRUD endpoints. |
 | **MCP Server Data** | Returns simulated market, competitor, ERP, and cost data generated at request time. | Connect to real data sources — competitor price feeds, POS/ERP APIs, market data providers — and implement caching/staleness checks. |
 | **Server-side RBAC** | Frontend routing restricts tabs by role; all authenticated users can invoke any API endpoint. | Add `cognito:groups` claim validation in Lambda authorizers. Enforce role-based access at the API layer, not just the UI. |
+| **Public Product Endpoints & Gateway Auth** | `GET /products` and `GET /products/{id}` need no authentication because the public Storefront calls them anonymously (`verify_deployment.py` also uses `/products` as an anonymous health check). The AgentCore Gateway uses inbound authorizer `NONE`, so anyone who knows its URL can call the MCP tools (simulated data only). | Put the catalog behind WAF/CloudFront rules or API keys if it should not be scrapeable. Configure the gateway with JWT (e.g. Cognito) or IAM inbound authorization and have the agents authenticate to it. |
 | **Hardcoded Demo Credentials** | `deploy.sh` creates demo users with preset passwords. MFA is still required. | Use SSM Parameter Store or Secrets Manager for initial credentials. Rotate on first use. |
 | **Guardrails Enforcement** | Bedrock Guardrails validate at the model level. Application-layer guardrails use hardcoded pass/fail for demo scenarios. | Call Bedrock Guardrails API at price-modification points (before writing to Products table) for runtime validation. |
-| **Kill Switches** | `SKIP_INPUT_SANITIZATION` and `DISABLE_BEDROCK_GUARDRAILS` env vars allow bypassing controls for local testing. | Remove or protect via AWS Service Control Policies (SCPs) and AWS Config rules. Never deploy to production. |
+| **Kill Switches** | `SKIP_INPUT_SANITIZATION` and `DISABLE_BEDROCK_GUARDRAILS` env vars allow bypassing controls for local testing. The demo creates no Bedrock guardrail: `deploy_agentcore.py` attaches the one named by `BEDROCK_GUARDRAIL_ID` / `BEDROCK_GUARDRAIL_VERSION` (default `mgu29odtpk6m` v4) only if it exists in the account, otherwise it warns and deploys the agents with `DISABLE_BEDROCK_GUARDRAILS=true`. | Remove or protect via AWS Service Control Policies (SCPs) and AWS Config rules. Never deploy to production. |
 | **Pricing Model** | Flat catalog pricing only — one price per product, all customers, all channels. Products with `mapPrice: null` behave as private-label (no MAP floor, cost floor only). | Add `pricingModel` field ("catalog", "private-label", "surge", "tiered") per product. Strategy Synthesis applies model-specific strategies. See "Extensible Pricing Models" below. |
 | **Architecture Pattern** | Synchronous Lambda → AgentCore invocation (optimized for real-time demo UX). | Migrate to EventBridge + Step Functions for async fan-out, independent agent scaling, automatic retries with DLQ, native event audit trail, and elimination of API Gateway timeout constraints. |
 

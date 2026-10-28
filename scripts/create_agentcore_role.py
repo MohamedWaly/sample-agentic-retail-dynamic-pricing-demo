@@ -1,9 +1,15 @@
-"""Create the IAM role required by Amazon Bedrock AgentCore Runtime.
+"""Create (or update in place) the IAM role required by Amazon Bedrock AgentCore Runtime.
 
 This script creates an IAM role with:
 - Trust policy allowing bedrock-agentcore.amazonaws.com to assume the role
-- Permissions for: Bedrock model invocation, ECR image pull, CloudWatch Logs,
-  DynamoDB access (for agents that need it)
+- Permissions for: Bedrock model invocation (and ApplyGuardrail), ECR image pull,
+  CloudWatch Logs, DynamoDB access (for agents that need it), MCP Lambda invoke,
+  AgentCore Memory data plane, AgentCore gateway invocation, and invoking the
+  specialist agent runtimes (orchestrator -> specialists)
+
+Idempotent: if the role already exists, its trust policy and inline policy are
+overwritten with the current definitions (put_role_policy), so rerunning this
+script is how permission changes reach an existing deployment.
 
 Usage:
     python scripts/create_agentcore_role.py [--region us-east-1] [--role-name RetailPricingAgentCoreRole]
@@ -135,6 +141,63 @@ def get_inline_policy(account_id: str, region: str) -> dict:
                     f"arn:aws:lambda:{region}:{account_id}:function:rdp-mcp-*",
                 ],
             },
+            {
+                # Data-plane calls the Strands AgentCoreMemorySessionManager makes
+                # (CreateEvent/GetEvent/ListEvents/DeleteEvent for session state,
+                # RetrieveMemoryRecords for long-term retrieval). Scoped to the
+                # memory created by scripts/setup_memory.py (ID = name + suffix).
+                "Sid": "AgentCoreMemoryDataPlane",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:CreateEvent",
+                    "bedrock-agentcore:GetEvent",
+                    "bedrock-agentcore:ListEvents",
+                    "bedrock-agentcore:DeleteEvent",
+                    "bedrock-agentcore:RetrieveMemoryRecords",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:memory/RetailDynamicPricingMemory-*",
+                ],
+            },
+            {
+                # The orchestrator invokes the five specialist runtimes with
+                # bedrock-agentcore InvokeAgentRuntime under this role. The trailing
+                # wildcard also covers the .../runtime-endpoint/DEFAULT ARN.
+                "Sid": "InvokeSpecialistRuntimes",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/retailPricing_*",
+                ],
+            },
+            {
+                # Gateway invocation, scoped to the gateway from scripts/setup_gateway.py.
+                # The sample gateway uses authorizerType NONE, so the agents need no
+                # credentials to call it; this keeps them working if the gateway is
+                # switched to AWS_IAM inbound authorization.
+                "Sid": "InvokeRetailPricingGateway",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:InvokeGateway",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:gateway/retail-pricing-gateway-*",
+                ],
+            },
+            {
+                # Needed only when a Bedrock guardrail is attached to the model
+                # (see backend/agents/agentcore/guardrail_config.py).
+                "Sid": "BedrockApplyGuardrail",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:ApplyGuardrail",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock:{region}:{account_id}:guardrail/*",
+                ],
+            },
         ],
     }
 
@@ -178,14 +241,19 @@ def create_role(
         else:
             raise
 
-    # Attach the inline policy
+    # Apply the inline policy. This runs for BOTH a new and an already-existing
+    # role: put_role_policy replaces the policy document, which is how new
+    # permissions reach a role created by an earlier version of this script.
     inline_policy = get_inline_policy(account_id, region)
     iam.put_role_policy(
         RoleName=role_name,
         PolicyName=INLINE_POLICY_NAME,
         PolicyDocument=json.dumps(inline_policy),
     )
-    logger.info("Attached inline policy: %s", INLINE_POLICY_NAME)
+    logger.info(
+        "Applied inline policy %s (%d statements)",
+        INLINE_POLICY_NAME, len(inline_policy["Statement"]),
+    )
 
     # Wait for role propagation
     logger.info("Waiting for IAM role propagation (10s)...")
@@ -215,7 +283,7 @@ def main() -> None:
     role_arn = create_role(session, args.role_name, args.region)
 
     logger.info("=" * 60)
-    logger.info("IAM Role created successfully!")
+    logger.info("IAM role ready (created, or updated in place)!")
     logger.info("Role ARN: %s", role_arn)
     logger.info("")
     logger.info("Use this ARN with deploy_agentcore.py:")

@@ -35,7 +35,9 @@ def create_session_manager(
         An AgentCoreMemorySessionManager instance, or None if memory is not configured.
     """
     if not MEMORY_ID:
-        logger.debug("AGENTCORE_MEMORY_ID not set; memory disabled for this agent.")
+        # WARNING, not DEBUG: the runtime's root logger drops DEBUG/INFO, so a
+        # missing AGENTCORE_MEMORY_ID would otherwise disable memory silently.
+        logger.warning("AGENTCORE_MEMORY_ID not set; memory disabled for this agent.")
         return None
 
     try:
@@ -53,6 +55,10 @@ def create_session_manager(
         memory_id=MEMORY_ID,
         session_id=session_id or f"session-{uuid.uuid4().hex}",
         actor_id=actor_id,
+    )
+    logger.info(
+        "AgentCore Memory enabled (memory_id=%s, actor_id=%s, session_id=%s)",
+        config.memory_id, config.actor_id, config.session_id,
     )
 
     return AgentCoreMemorySessionManager(

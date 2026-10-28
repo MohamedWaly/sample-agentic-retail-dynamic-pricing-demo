@@ -324,11 +324,36 @@ TOOLS = {
 }
 
 
+# AgentCore Gateway passes Lambda targets the tool name as "<target>___<tool>".
+_GATEWAY_TOOL_DELIMITER = "___"
+
+
+def _gateway_tool_name(context) -> str | None:
+    """Return the tool name when invoked by an AgentCore Gateway Lambda target.
+
+    The gateway passes the tool arguments as the event and the tool name in
+    context.client_context.custom["bedrockAgentCoreToolName"]. Returns None for
+    direct invocations, which carry no gateway metadata.
+
+    NOTE: identical copy in each backend/mcp_servers/*/handler.py. Each Lambda is
+    packaged from its own directory, so the helper cannot be shared.
+    """
+    custom = getattr(getattr(context, "client_context", None), "custom", None)
+    if not isinstance(custom, dict):
+        return None
+    name = custom.get("bedrockAgentCoreToolName")
+    if not isinstance(name, str) or not name:
+        return None
+    return name.split(_GATEWAY_TOOL_DELIMITER, 1)[-1]
+
+
 def handler(event, context):
     """Lambda handler for Cost & Finance MCP Server.
 
     Dispatches to the appropriate tool function based on the 'tool' field
-    in the event body.
+    in the event body. Also accepts the AgentCore Gateway invocation shape: the
+    event is the tool arguments and the tool name is in the Lambda context
+    (see _gateway_tool_name).
 
     Args:
         event: Lambda event payload containing MCP tool invocation details.
@@ -350,6 +375,12 @@ def handler(event, context):
 
     tool_name = body.get("tool")
     params = body.get("params", {})
+
+    if not tool_name:
+        # AgentCore Gateway invocation: the event is the tool arguments.
+        tool_name = _gateway_tool_name(context)
+        if tool_name:
+            params = body
 
     if not tool_name:
         return _build_error_response(

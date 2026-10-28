@@ -457,3 +457,44 @@ when `scripts/setup_gateway.py` tries to register the MCP Server targets right a
 **Root Cause:** These packages are build-time tooling for Tailwind/PostCSS. They run only during `npm run build` to generate the static CSS/JS and are **not included in the deployed `dist/` bundle**. The advisories are ReDoS / CPU-exhaustion issues reachable only when an attacker controls the build inputs (glob patterns, selectors) — not a runtime exposure for a static frontend built by the project owner.
 **Fix:** Intentionally deferred. The only `npm audit fix --force` remediation bumps `tailwindcss` to a new major version, which carries breaking changes (config format and utility-class changes) that would require re-validating both frontends' styling. We do not bundle a breaking major upgrade into routine security-patch merges.
 **Prevention / when to act:** If a fully clean `npm audit` is required, perform a dedicated Tailwind major upgrade on its own branch: bump `tailwindcss` and its chain, rebuild both frontends, and visually verify the dashboard and storefront before merging. Treat it as a tracked UI task, not a dependency-patch.
+
+---
+
+## Post-Deploy Fixes
+
+Defects found by checking a finished `./deploy.sh` run against the live account. Each is fixed in the current codebase; entries are kept for future reference.
+
+### Issue: Dependency scan crashed but `deploy.sh` printed "No known vulnerabilities found"
+
+**Symptom:** Step 1.5 showed a `pip-audit` traceback (`ensurepip ... died with <Signals.SIGABRT: 6>`) immediately followed by `✓ No known vulnerabilities found in dependencies`. A real finding (`multidict` 6.9.0, CVE-2026-104874, fixed in 6.9.1) was never reported.
+**Root Cause:** The scan was `if pip-audit ... | tail -5; then`, which tests the exit status of `tail`, not `pip-audit`, so it always passed. Separately, `pip-audit`'s default mode builds a temporary virtualenv to resolve `-r requirements.txt`, and that step aborted on this host.
+**Fix:** Step 1.5 now audits the pinned set directly (`--no-deps --disable-pip --strict`, no temporary venv), tests `pip-audit`'s own exit status, and reports exactly one of: no known vulnerabilities (✓), vulnerabilities found (listed, deploy continues), or scan could not run (warning, never ✓). It also audits the dependency set the agent containers would install (resolved with `pip install --dry-run`, because `backend/agents/agentcore/requirements.txt` is unpinned). `multidict` is bumped to 6.9.1 and floored in the container requirements.
+**Prevention:** Never pipe a gate command into another command inside an `if`; capture the output and test the real status.
+
+### Issue: Agents deployed without the gateway and memory (no MCP tools, memory disabled)
+
+**Symptom:** `get-agent-runtime` returned no `environmentVariables` for any runtime. Agents answered from the model alone ("AGENTCORE_MEMORY_ID not set; memory disabled for this agent" was only logged at DEBUG, so nothing surfaced), and the orchestrator image could not start (`KeyError` on the five `*_AGENT_ARN` variables).
+**Root Cause:** `deploy.sh` deployed the agents (Step 3) before the gateway and memory existed (Step 5), and `scripts/deploy_agentcore.py` never set `AGENTCORE_GATEWAY_ENDPOINT` / `AGENTCORE_MEMORY_ID` (or the model IDs, or the specialist ARNs) on the runtimes. The gateway code path had never run against a real endpoint and had its own defects: `MCPClient.streamable_http` does not exist (use `MCPClient(url=<gatewayUrl>/mcp)`), `get_guardrail_config()` returned kwargs that `strands.Agent` rejects (`TypeError`; guardrails belong on `BedrockModel`), and the runtime role had no AgentCore Memory or `InvokeAgentRuntime` permissions.
+**Fix:** `deploy.sh` now creates the IAM role, gateway and memory (Step 3) before deploying the agents (Step 4) and re-deploying CDK (Step 5). `deploy_agentcore.py` discovers the gateway and memory by name, exits non-zero before building anything if either is missing, and sets the environment variables on every runtime on create and update. The role policy gains scoped memory, runtime-invoke, gateway-invoke and `ApplyGuardrail` statements (re-run `create_agentcore_role.py` to update an existing role in place). `verify_deployment.py` now fails if any runtime lacks the gateway/memory variables. If the default Bedrock guardrail does not exist in the account, the agents are deployed with `DISABLE_BEDROCK_GUARDRAILS=true` and a warning.
+**Prevention:** Create dependencies before the resources that consume them, and make the verification gate check the wiring, not only that the resources exist.
+
+### Issue: Gateway tool calls always returned `MISSING_TOOL`
+
+**Symptom:** Calling any tool through the AgentCore Gateway reached the MCP Lambda but returned an error body with code `MISSING_TOOL`.
+**Root Cause:** For Lambda targets the gateway passes the tool arguments as the Lambda event and the tool name in `context.client_context.custom["bedrockAgentCoreToolName"]` (`<target>___<tool>`). The four handlers only understood the direct-invoke shape `{"tool": ..., "params": {...}}`.
+**Fix:** Each handler falls back to the gateway shape when the event has no `tool` field; the direct-invoke contract is unchanged.
+**Prevention:** Test Lambda targets with the context object the gateway actually sends (see `tests/test_mcp_gateway_invocation.py`).
+
+### Issue: Every agent image ran the competitive-intelligence agent
+
+**Symptom:** The six images were built from one Dockerfile but all started `competitive_intelligence_runtime`.
+**Root Cause:** `deploy_agentcore.py` passed `--build-arg AGENT_MODULE=...`, but the Dockerfile declares `ARG AGENT_ENTRYPOINT`; the unknown build arg was silently ignored and the default won.
+**Fix:** The script passes `--build-arg AGENT_ENTRYPOINT=<module>`.
+**Prevention:** After building, check `docker inspect` shows the expected `AGENT_ENTRYPOINT` for each image.
+
+### Issue: `setup_memory.py` was not idempotent
+
+**Symptom:** Re-running `deploy.sh` could create a second AgentCore Memory or abort.
+**Root Cause:** The existing-memory check treated `list_memories()` (a list) as a dict, swallowed the resulting error, matched on a `name` field the summaries do not have, and compared against the base name while the real ID carries a random suffix (`RetailDynamicPricingMemory-Ab12Cd34Ef`).
+**Fix:** The check now matches on the ID prefix, reuses the existing memory, and lets lookup errors fail the script instead of falling through to create.
+**Prevention:** Look resources up by what the API actually returns, and never create after a failed lookup.

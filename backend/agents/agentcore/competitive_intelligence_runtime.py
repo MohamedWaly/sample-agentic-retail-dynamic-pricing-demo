@@ -19,10 +19,11 @@ import os
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
+from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 
 from backend.agents.agentcore.memory_config import create_session_manager
-from backend.agents.agentcore.guardrail_config import get_guardrail_config
+from backend.agents.agentcore.guardrail_config import get_guardrail_model_kwargs
 from shared.model_config import SPECIALIST_MODEL
 
 logger = logging.getLogger(__name__)
@@ -87,9 +88,10 @@ def invoke(payload: dict) -> dict:
         # Configure tools via AgentCore Gateway or fallback to direct import
         tools = []
         if GATEWAY_ENDPOINT:
-            mcp_client = MCPClient(
-                lambda: MCPClient.streamable_http(GATEWAY_ENDPOINT)
-            )
+            # AGENTCORE_GATEWAY_ENDPOINT is the gateway's MCP URL (<gatewayUrl>/mcp).
+            # The MCPClient is a tool provider: the Agent loads the gateway's tools
+            # from it and manages the connection lifecycle.
+            mcp_client = MCPClient(url=GATEWAY_ENDPOINT)
             tools = [mcp_client]
         else:
             # Fallback: import tools directly from the agent module
@@ -110,17 +112,21 @@ def invoke(payload: dict) -> dict:
                 "status": "success",
             }
 
-        # Create agent with memory and gateway tools
-        guardrail_kwargs = get_guardrail_config()
+        # Create agent with memory and gateway tools. The Bedrock guardrail (if
+        # configured) is attached to the model, not to the Agent.
+        model = BedrockModel(model_id=SPECIALIST_MODEL, **get_guardrail_model_kwargs())
         agent = Agent(
-            model=SPECIALIST_MODEL,
+            model=model,
             system_prompt=SYSTEM_PROMPT,
             tools=tools,
             session_manager=session_manager,
-            **guardrail_kwargs,
         )
 
-        result = agent(full_prompt)
+        try:
+            result = agent(full_prompt)
+        finally:
+            # Release the gateway MCP connection created for this invocation.
+            agent.cleanup()
 
         return {
             "result": str(result),
